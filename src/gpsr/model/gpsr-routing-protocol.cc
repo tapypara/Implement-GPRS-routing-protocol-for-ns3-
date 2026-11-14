@@ -5,14 +5,18 @@
 #include "gpsr-routing-protocol.h"
 
 #include "ns3/arp-cache.h"
+#include "ns3/boolean.h"
 #include "ns3/double.h"
 #include "ns3/inet-socket-address.h"
+#include "ns3/llc-snap-header.h"
 #include "ns3/log.h"
 #include "ns3/node-list.h"
 #include "ns3/output-stream-wrapper.h"
 #include "ns3/simulator.h"
+#include "ns3/txop.h"
 #include "ns3/udp-socket-factory.h"
 #include "ns3/uinteger.h"
+#include "ns3/wifi-mac-queue.h"
 #include "ns3/wifi-net-device.h"
 
 #include <algorithm>
@@ -30,6 +34,7 @@ namespace gpsr
 NS_OBJECT_ENSURE_REGISTERED(RoutingProtocol);
 NS_OBJECT_ENSURE_REGISTERED(HelloHeader);
 NS_OBJECT_ENSURE_REGISTERED(PerimeterTag);
+NS_OBJECT_ENSURE_REGISTERED(ArrivalTag);
 
 const uint32_t RoutingProtocol::GPSR_PORT = 666;
 
@@ -159,7 +164,8 @@ PerimeterTag::PerimeterTag()
       m_lastFacePos(Vector(0, 0, 0)),
       m_prevHop(Ipv4Address::GetZero()),
       m_e0Sender(Ipv4Address::GetZero()),
-      m_e0Receiver(Ipv4Address::GetZero())
+      m_e0Receiver(Ipv4Address::GetZero()),
+      m_hops(0)
 {
 }
 
@@ -182,7 +188,7 @@ PerimeterTag::GetInstanceTypeId() const
 uint32_t
 PerimeterTag::GetSerializedSize() const
 {
-    return 1 + 4 * 2 * sizeof(double) + 3 * sizeof(uint32_t);
+    return 1 + 4 * 2 * sizeof(double) + 3 * sizeof(uint32_t) + sizeof(uint16_t);
 }
 
 void
@@ -196,6 +202,7 @@ PerimeterTag::Serialize(TagBuffer i) const
     i.WriteU32(m_prevHop.Get());
     i.WriteU32(m_e0Sender.Get());
     i.WriteU32(m_e0Receiver.Get());
+    i.WriteU16(m_hops);
 }
 
 void
@@ -209,6 +216,7 @@ PerimeterTag::Deserialize(TagBuffer i)
     m_prevHop = Ipv4Address(i.ReadU32());
     m_e0Sender = Ipv4Address(i.ReadU32());
     m_e0Receiver = Ipv4Address(i.ReadU32());
+    m_hops = i.ReadU16();
 }
 
 void
@@ -216,7 +224,34 @@ PerimeterTag::Print(std::ostream& os) const
 {
     os << "M=" << (m_inRec ? "perimeter" : "greedy") << " Lp=" << m_recPos << " D=" << m_dstPos
        << " Lf=" << m_lastFacePos << " e0=(" << m_e0Sender << "->" << m_e0Receiver
-       << ") prev=" << m_prevHop;
+       << ") prev=" << m_prevHop << " hops=" << m_hops;
+}
+
+/********************************************************************
+ * ArrivalTag
+ ********************************************************************/
+
+ArrivalTag::ArrivalTag() = default;
+
+ArrivalTag::ArrivalTag(const PerimeterTag& t)
+    : PerimeterTag(t)
+{
+}
+
+TypeId
+ArrivalTag::GetTypeId()
+{
+    static TypeId tid = TypeId("ns3::gpsr::ArrivalTag")
+                            .SetParent<PerimeterTag>()
+                            .SetGroupName("Gpsr")
+                            .AddConstructor<ArrivalTag>();
+    return tid;
+}
+
+TypeId
+ArrivalTag::GetInstanceTypeId() const
+{
+    return GetTypeId();
 }
 
 /********************************************************************
@@ -441,7 +476,17 @@ RoutingProtocol::GetTypeId()
                           "Planarization for perimeter mode: 0 = RNG, 1 = GG",
                           UintegerValue(0),
                           MakeUintegerAccessor(&RoutingProtocol::m_planarMode),
-                          MakeUintegerChecker<uint32_t>(0, 1));
+                          MakeUintegerChecker<uint32_t>(0, 1))
+            .AddAttribute("Promiscuous",
+                          "Overhear data packets for other nodes to learn neighbor positions, "
+                          "and reset the beacon timer whenever a data packet is sent (Sec. 2.1, 2.5)",
+                          BooleanValue(true),
+                          MakeBooleanAccessor(&RoutingProtocol::m_promiscuous),
+                          MakeBooleanChecker())
+            .AddTraceSource("Delivered",
+                            "A data packet reached its destination: packet, hops, source, destination",
+                            MakeTraceSourceAccessor(&RoutingProtocol::m_deliveredTrace),
+                            "ns3::gpsr::RoutingProtocol::DeliveredTracedCallback");
     return tid;
 }
 
@@ -450,7 +495,9 @@ RoutingProtocol::RoutingProtocol()
       m_helloTimer(Timer::CANCEL_ON_DESTROY),
       m_ipv4(nullptr),
       m_planarMode(0),
-      m_mainIface(-1)
+      m_mainIface(-1),
+      m_promiscuous(true),
+      m_wifi(nullptr)
 {
     m_uniformRandomVariable = CreateObject<UniformRandomVariable>();
 }
@@ -469,6 +516,8 @@ RoutingProtocol::DoDispose()
     m_socketAddresses.clear();
     m_helloTimer.Cancel();
     m_neighbors.Clear();
+    m_ucb = UnicastForwardCallback();
+    m_wifi = nullptr;
     m_ipv4 = nullptr;
     Ipv4RoutingProtocol::DoDispose();
 }
@@ -528,6 +577,17 @@ RoutingProtocol::ScheduleNextHello()
     m_helloTimer.Schedule(Seconds(m_uniformRandomVariable->GetValue(0.5 * b, 1.5 * b)));
 }
 
+namespace
+{
+uint64_t g_beaconTx = 0;
+}
+
+uint64_t
+RoutingProtocol::GetBeaconTxCount()
+{
+    return g_beaconTx;
+}
+
 void
 RoutingProtocol::SendHello()
 {
@@ -537,6 +597,7 @@ RoutingProtocol::SendHello()
         Ptr<Packet> packet = Create<Packet>();
         packet->AddHeader(hh);
         kv.first->SendTo(packet, 0, InetSocketAddress(kv.second.GetBroadcast(), GPSR_PORT));
+        ++g_beaconTx;
     }
     ScheduleNextHello();
 }
@@ -562,8 +623,9 @@ RoutingProtocol::RecvGPSR(Ptr<Socket> socket)
 void
 RoutingProtocol::NotifyTxError(WifiMacDropReason reason, Ptr<const WifiMpdu> mpdu)
 {
-    // Sec. 2.5: MAC-layer failure feedback. Retry limit exceeded on a unicast frame means
-    // the next hop is gone; drop it from the neighbor table at once instead of waiting 4.5 B.
+    // Sec. 2.5: MAC-layer failure feedback. Retry limit exceeded on a unicast frame means the
+    // next hop has left radio range. We are inside the MAC's own callback, so do the work
+    // (touching the MAC queue, re-sending) in a separate event.
     if (!m_ipv4 || reason != WIFI_MAC_DROP_REACHED_RETRY_LIMIT)
     {
         return;
@@ -574,6 +636,12 @@ RoutingProtocol::NotifyTxError(WifiMacDropReason reason, Ptr<const WifiMpdu> mpd
     {
         return;
     }
+    Simulator::ScheduleNow(&RoutingProtocol::HandleLinkFailure, this, mpdu, a1);
+}
+
+void
+RoutingProtocol::DeleteNeighborsByMac(Mac48Address mac)
+{
     Ptr<Ipv4L3Protocol> l3 = m_ipv4->GetObject<Ipv4L3Protocol>();
     for (const auto& kv : m_socketAddresses)
     {
@@ -587,12 +655,132 @@ RoutingProtocol::NotifyTxError(WifiMacDropReason reason, Ptr<const WifiMpdu> mpd
         {
             continue;
         }
-        for (ArpCache::Entry* e : cache->LookupInverse(a1))
+        for (ArpCache::Entry* e : cache->LookupInverse(mac))
         {
             NS_LOG_DEBUG("MAC retry limit: removing neighbor " << e->GetIpv4Address());
             m_neighbors.DeleteEntry(e->GetIpv4Address());
         }
     }
+}
+
+void
+RoutingProtocol::HandleLinkFailure(Ptr<const WifiMpdu> failed, Mac48Address receiver)
+{
+    if (!m_ipv4)
+    {
+        return;
+    }
+    DeleteNeighborsByMac(receiver);
+
+    // Packets to re-forward: the one that just failed, plus every IPv4 packet still waiting in the
+    // interface queue for the same receiver (otherwise each would block the interface in turn).
+    std::list<Ptr<Packet>> pkts;
+    pkts.push_back(failed->GetPacket()->Copy());
+    if (m_wifi && m_wifi->GetMac() && m_wifi->GetMac()->GetTxop())
+    {
+        Ptr<WifiMacQueue> q = m_wifi->GetMac()->GetTxop()->GetWifiMacQueue();
+        WifiContainerQueueId qid = WifiMacQueueContainer::GetQueueId(failed);
+        Ptr<WifiMpdu> m = q->PeekByQueueId(qid);
+        while (m)
+        {
+            Ptr<WifiMpdu> next = q->PeekByQueueId(qid, m); // compute before removing m
+            Ptr<Packet> copy = m->GetPacket()->Copy();
+            LlcSnapHeader llc;
+            copy->PeekHeader(llc);
+            if (llc.GetType() == Ipv4L3Protocol::PROT_NUMBER) // leave ARP etc. alone
+            {
+                pkts.push_back(m->GetPacket()->Copy());
+                q->Remove(m);
+            }
+            m = next;
+        }
+    }
+    for (const auto& p : pkts)
+    {
+        ReForward(p);
+    }
+}
+
+void
+RoutingProtocol::ReForward(Ptr<Packet> pkt)
+{
+    if (m_ucb.IsNull() || m_mainIface < 0)
+    {
+        return;
+    }
+    LlcSnapHeader llc;
+    pkt->RemoveHeader(llc);
+    if (llc.GetType() != Ipv4L3Protocol::PROT_NUMBER)
+    {
+        return;
+    }
+    Ipv4Header iph;
+    pkt->RemoveHeader(iph);
+    ArrivalTag arr;
+    if (!pkt->RemovePacketTag(arr))
+    {
+        return; // not a GPSR data packet
+    }
+    PerimeterTag stale;
+    pkt->RemovePacketTag(stale);
+
+    PerimeterTag tag(arr); // state exactly as when the packet arrived at this node
+    Ipv4Address nextHop;
+    if (!DecideNextHop(tag, iph.GetDestination(), nextHop))
+    {
+        return; // no alternative next hop: drop
+    }
+    pkt->AddPacketTag(tag);
+    pkt->AddPacketTag(arr);
+    if (iph.GetTtl() < 255)
+    {
+        iph.SetTtl(iph.GetTtl() + 1); // IpForward will decrement it again
+    }
+    Ptr<Ipv4Route> route = Create<Ipv4Route>();
+    route->SetDestination(iph.GetDestination());
+    route->SetGateway(nextHop);
+    route->SetSource(iph.GetSource());
+    route->SetOutputDevice(m_ipv4->GetNetDevice(m_mainIface));
+    m_ucb(route, pkt, iph);
+    ResetHelloTimer();
+}
+
+void
+RoutingProtocol::PromiscRecv(Ptr<NetDevice> dev,
+                             Ptr<const Packet> p,
+                             uint16_t protocol,
+                             const Address& from,
+                             const Address& to,
+                             NetDevice::PacketType type)
+{
+    // Only frames addressed to other nodes; frames for us are handled in RouteInput.
+    if (type != NetDevice::PACKET_OTHERHOST || !m_ipv4)
+    {
+        return;
+    }
+    PerimeterTag tag;
+    if (p->PeekPacketTag(tag) && tag.GetPrevHop() != Ipv4Address::GetZero())
+    {
+        m_neighbors.AddEntry(tag.GetPrevHop(), tag.GetLastPos());
+    }
+}
+
+void
+RoutingProtocol::ResetHelloTimer()
+{
+    // Sec. 2.1: any data packet we send also announces our position (to neighbors that overhear
+    // it), so the inter-beacon timer is restarted. Only valid when overhearing is enabled.
+    if (m_promiscuous && m_helloTimer.IsRunning())
+    {
+        m_helloTimer.Cancel();
+        ScheduleNextHello();
+    }
+}
+
+uint32_t
+RoutingProtocol::GetNeighborCount()
+{
+    return m_neighbors.Size();
 }
 
 void
@@ -636,6 +824,18 @@ RoutingProtocol::TryCreateSocket(uint32_t interface)
         wifi->GetMac()->TraceConnectWithoutContext(
             "DroppedMpdu",
             MakeCallback(&RoutingProtocol::NotifyTxError, this));
+        if (static_cast<int32_t>(interface) == m_mainIface)
+        {
+            m_wifi = wifi;
+        }
+    }
+    if (m_promiscuous && static_cast<int32_t>(interface) == m_mainIface)
+    {
+        m_ipv4->GetObject<Node>()->RegisterProtocolHandler(
+            MakeCallback(&RoutingProtocol::PromiscRecv, this),
+            Ipv4L3Protocol::PROT_NUMBER,
+            l3->GetNetDevice(interface),
+            true);
     }
 
     if (!m_helloTimer.IsRunning())
@@ -819,6 +1019,7 @@ RoutingProtocol::DecideNextHop(PerimeterTag& tag, Ipv4Address dst, Ipv4Address& 
     // to refresh our entry in its neighbor table (position piggybacking, Sec. 2.1).
     tag.SetPrevHop(myIp);
     tag.SetLastPos(myPos);
+    tag.SetHops(tag.GetHops() + 1);
     return true;
 }
 
@@ -874,6 +1075,7 @@ RoutingProtocol::RouteOutput(Ptr<Packet> p,
 
     PerimeterTag tag; // mode = greedy
     tag.SetDstPos(dstPos);
+    const ArrivalTag arrival(tag); // state before this node's decision (for re-forwarding)
     Ipv4Address nextHop;
     if (!DecideNextHop(tag, dst, nextHop))
     {
@@ -883,7 +1085,11 @@ RoutingProtocol::RouteOutput(Ptr<Packet> p,
 
     PerimeterTag old;
     p->RemovePacketTag(old);
+    ArrivalTag oldArrival;
+    p->RemovePacketTag(oldArrival);
     p->AddPacketTag(tag);
+    p->AddPacketTag(arrival);
+    ResetHelloTimer();
 
     Ptr<Ipv4Route> route = Create<Ipv4Route>();
     route->SetDestination(dst);
@@ -907,6 +1113,10 @@ RoutingProtocol::RouteInput(Ptr<const Packet> p,
     {
         return false;
     }
+    if (m_ucb.IsNull())
+    {
+        m_ucb = ucb; // L3's forwarding callback is the same for every call; keep it for re-forwarding
+    }
     const Ipv4Address dst = header.GetDestination();
     const int32_t iif = m_ipv4->GetInterfaceForDevice(idev);
 
@@ -922,6 +1132,10 @@ RoutingProtocol::RouteInput(Ptr<const Packet> p,
     // Local delivery (unicast to us, or broadcast such as beacons).
     if (m_ipv4->IsDestinationAddress(dst, iif))
     {
+        if (hasTag && !dst.IsBroadcast() && !dst.IsMulticast())
+        {
+            m_deliveredTrace(p, seen.GetHops(), header.GetSource(), dst);
+        }
         if (!lcb.IsNull())
         {
             lcb(p, header, iif);
@@ -946,6 +1160,9 @@ RoutingProtocol::RouteInput(Ptr<const Packet> p,
         }
         tag.SetDstPos(d);
     }
+    ArrivalTag staleArrival;
+    packet->RemovePacketTag(staleArrival);
+    const ArrivalTag arrival(tag); // state as it arrived here (for re-forwarding after a MAC failure)
 
     Ipv4Address nextHop;
     if (!DecideNextHop(tag, dst, nextHop))
@@ -955,6 +1172,8 @@ RoutingProtocol::RouteInput(Ptr<const Packet> p,
         return true;
     }
     packet->AddPacketTag(tag);
+    packet->AddPacketTag(arrival);
+    ResetHelloTimer();
 
     Ptr<Ipv4Route> route = Create<Ipv4Route>();
     route->SetDestination(dst);

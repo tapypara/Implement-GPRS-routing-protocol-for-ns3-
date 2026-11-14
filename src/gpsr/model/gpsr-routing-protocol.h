@@ -18,8 +18,10 @@
 #include "ns3/tag.h"
 #include "ns3/timer.h"
 #include "ns3/vector.h"
+#include "ns3/traced-callback.h"
 #include "ns3/wifi-mac.h"
 #include "ns3/wifi-mpdu.h"
+#include "ns3/wifi-net-device.h"
 
 #include <map>
 #include <ostream>
@@ -95,6 +97,8 @@ class PerimeterTag : public Tag
     void SetPrevHop(Ipv4Address a) { m_prevHop = a; }
     Ipv4Address GetE0Sender() const { return m_e0Sender; }
     Ipv4Address GetE0Receiver() const { return m_e0Receiver; }
+    uint16_t GetHops() const { return m_hops; }         //!< hops travelled so far
+    void SetHops(uint16_t v) { m_hops = v; }
 
     void SetE0(Ipv4Address s, Ipv4Address r)
     {
@@ -111,6 +115,21 @@ class PerimeterTag : public Tag
     Ipv4Address m_prevHop;  //!< previous hop id
     Ipv4Address m_e0Sender; //!< e0
     Ipv4Address m_e0Receiver;
+    uint16_t m_hops;        //!< number of hops travelled (statistics only)
+};
+
+/**
+ * Copy of the PerimeterTag as it was when the packet ARRIVED at this node (before this
+ * node's forwarding decision changed it). Needed to re-forward a packet after a MAC
+ * failure (Sec. 2.5) exactly as if it had just arrived.
+ */
+class ArrivalTag : public PerimeterTag
+{
+  public:
+    ArrivalTag();
+    explicit ArrivalTag(const PerimeterTag& t);
+    static TypeId GetTypeId();
+    TypeId GetInstanceTypeId() const override;
 };
 
 struct NeighborEntry
@@ -187,6 +206,12 @@ class RoutingProtocol : public Ipv4RoutingProtocol
 
     void RecvGPSR(Ptr<Socket> socket);
 
+    /** Number of live entries in the one-hop neighbor table (paper Sec. 3.6: state per node). */
+    uint32_t GetNeighborCount();
+
+    /** Total beacon packets sent network-wide since program start (paper Fig. 10 overhead). */
+    static uint64_t GetBeaconTxCount();
+
   protected:
     void DoDispose() override;
 
@@ -195,6 +220,18 @@ class RoutingProtocol : public Ipv4RoutingProtocol
     void ScheduleNextHello();
     void TryCreateSocket(uint32_t interface);
     void NotifyTxError(WifiMacDropReason reason, Ptr<const WifiMpdu> mpdu);
+    /** Sec. 2.5: drop the failed neighbor, empty the interface queue of its packets, re-forward. */
+    void HandleLinkFailure(Ptr<const WifiMpdu> failed, Mac48Address receiver);
+    void DeleteNeighborsByMac(Mac48Address mac);
+    void ReForward(Ptr<Packet> llcPacket);
+    /** Sec. 2.1/2.5: overhear data packets addressed to other nodes (promiscuous mode). */
+    void PromiscRecv(Ptr<NetDevice> dev,
+                     Ptr<const Packet> p,
+                     uint16_t protocol,
+                     const Address& from,
+                     const Address& to,
+                     NetDevice::PacketType type);
+    void ResetHelloTimer();
 
     Vector GetMyPosition() const;
     bool GetDestinationPosition(Ipv4Address dst, Vector& pos) const;
@@ -214,6 +251,11 @@ class RoutingProtocol : public Ipv4RoutingProtocol
     Ptr<UniformRandomVariable> m_uniformRandomVariable;
     uint32_t m_planarMode;
     int32_t m_mainIface; //!< the (single) wireless interface used for forwarding
+    bool m_promiscuous;  //!< overhear data packets + reset beacon timer when sending data
+    Ptr<WifiNetDevice> m_wifi;
+    UnicastForwardCallback m_ucb; //!< cached from RouteInput, used for re-forwarding
+    /// Fired when a data packet reaches its destination: packet, hops travelled, src, dst.
+    TracedCallback<Ptr<const Packet>, uint32_t, Ipv4Address, Ipv4Address> m_deliveredTrace;
 };
 
 } // namespace gpsr
